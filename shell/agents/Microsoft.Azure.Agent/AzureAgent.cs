@@ -2,6 +2,7 @@
 using System.Text;
 
 using AIShell.Abstraction;
+using Azure.Identity;
 using Serilog;
 
 namespace Microsoft.Azure.Agent;
@@ -16,8 +17,9 @@ public sealed class AzureAgent : ILLMAgent
     public string SettingFile { private set; get; }
 
     internal ArgumentPlaceholder ArgPlaceholder { set; get; }
+    internal CopilotResponse CopilotResponse => _copilotResponse;
 
-    private const string SettingFileName = "az.agent.json";
+    private const string SettingFileName = "az.config.json";
     private const string LoggingFileName = "log..txt";
     private const string InstructionPrompt = """
         NOTE: follow the below instructions when generating responses that include Azure CLI commands with placeholders:
@@ -36,6 +38,8 @@ public sealed class AzureAgent : ILLMAgent
         """;
 
     private int _turnsLeft;
+    private CopilotResponse _copilotResponse;
+    private AgentSetting _setting;
 
     private readonly string _instructions;
     private readonly StringBuilder _buffer;
@@ -53,7 +57,7 @@ public sealed class AzureAgent : ILLMAgent
         _valueStore = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         _instructions = string.Format(InstructionPrompt, Environment.OSVersion.VersionString);
 
-        Name = "Azure";
+        Name = "azure";
         Company = "Microsoft";
         Description = "This AI assistant can generate Azure CLI and Azure PowerShell commands for managing Azure resources, answer questions, and provides information tailored to your specific Azure environment.";
 
@@ -74,36 +78,136 @@ public sealed class AzureAgent : ILLMAgent
 
     public void Dispose()
     {
-        ArgPlaceholder?.DataRetriever?.Dispose();
+        ResetArgumentPlaceholder();
         _chatSession.Dispose();
         _httpClient.Dispose();
 
         Log.CloseAndFlush();
+        Telemetry.CloseAndFlush();
     }
 
     public void Initialize(AgentConfig config)
     {
-        _turnsLeft = int.MaxValue;
         SettingFile = Path.Combine(config.ConfigurationRoot, SettingFileName);
 
-        string logFile = Path.Combine(config.ConfigurationRoot, LoggingFileName);
-        Log.Logger = new LoggerConfiguration()
-            .WriteTo.Async(a => a.File(
-                path: logFile,
-                outputTemplate: "{Timestamp:HH:mm:ss} [{Level:u3}] {Message:lj}{NewLine}{Exception}",
-                rollingInterval: RollingInterval.Day))
-            .CreateLogger();
-        Log.Information("Azure agent initialized.");
+        _turnsLeft = int.MaxValue;
+        _setting = AgentSetting.LoadFromFile(SettingFile);
+
+        if (_setting is null)
+        {
+            // Use default setting and create a setting file with the default settings.
+            _setting = AgentSetting.Default;
+            AgentSetting.NewSettingFile(SettingFile);
+        }
+
+        if (_setting.Logging)
+        {
+            string logFile = Path.Combine(config.ConfigurationRoot, LoggingFileName);
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Debug()
+                .WriteTo.Async(a => a.File(
+                    path: logFile,
+                    outputTemplate: "{Timestamp:HH:mm:ss} [{Level:u3}] {Message:lj}{NewLine}{Exception}",
+                    rollingInterval: RollingInterval.Day))
+                .CreateLogger();
+            Log.Information("Azure agent initialized.");
+        }
+
+        if (_setting.Telemetry)
+        {
+            Telemetry.Initialize();
+        }
     }
 
     public IEnumerable<CommandBase> GetCommands() => [new ReplaceCommand(this)];
-    public bool CanAcceptFeedback(UserAction action) => false;
-    public void OnUserAction(UserActionPayload actionPayload) {}
+    public bool CanAcceptFeedback(UserAction action) => Telemetry.Enabled;
 
-    public async Task RefreshChatAsync(IShell shell)
+    public void OnUserAction(UserActionPayload actionPayload)
     {
-        // Refresh the chat session.
-        await _chatSession.RefreshAsync(shell.Host, shell.CancellationToken);
+        // Send telemetry about the user action.
+        bool isUserFeedback = false;
+        bool shareConversation = false;
+        string details = null;
+        string action = actionPayload.Action.ToString();
+
+        switch (actionPayload)
+        {
+            case DislikePayload dislike:
+                isUserFeedback = true;
+                shareConversation = dislike.ShareConversation;
+                details = string.Format("{0} | {1}", dislike.ShortFeedback, dislike.LongFeedback);
+                break;
+
+            case LikePayload like:
+                isUserFeedback = true;
+                shareConversation = like.ShareConversation;
+                break;
+
+            default:
+                break;
+        }
+
+        if (isUserFeedback)
+        {
+            Telemetry.Trace(AzTrace.Feedback(action, shareConversation, _copilotResponse, details));
+        }
+        else
+        {
+            Telemetry.Trace(AzTrace.UserAction(action, _copilotResponse, details));
+        }
+    }
+
+    public async Task RefreshChatAsync(IShell shell, bool force)
+    {
+        IHost host = shell.Host;
+        CancellationToken cancellationToken = shell.CancellationToken;
+        ResetArgumentPlaceholder();
+
+        try
+        {
+            string welcome = await host.RunWithSpinnerAsync(
+                status: "Initializing ...",
+                spinnerKind: SpinnerKind.Processing,
+                func: async context => await _chatSession.RefreshAsync(context, force, cancellationToken)
+            ).ConfigureAwait(false);
+
+            if (!string.IsNullOrEmpty(welcome))
+            {
+                _turnsLeft = int.MaxValue;
+                host.WriteLine(welcome);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            host.WriteErrorLine("Operation cancelled. Please run '/refresh' to start a new conversation.");
+        }
+        catch (TokenRequestException e)
+        {
+            if (e.UserUnauthorized)
+            {
+                host.WriteLine("Sorry, you are not authorized to access Azure Copilot services.");
+                host.WriteLine($"Details: {e.Message}");
+                return;
+            }
+
+            Exception inner = e.InnerException;
+            if (inner is CredentialUnavailableException)
+            {
+                host.WriteErrorLine($"Failed to start a chat session: Access token not available.");
+                host.WriteErrorLine($"The '{Name}' agent depends on the Azure CLI credential to acquire access token. Please run 'az login' from a command-line shell to setup account.");
+                host.WriteErrorLine("Once you've successfully logged in, please run '/refresh' to start a new conversation");
+                return;
+            }
+
+            host.WriteErrorLine(e.Message);
+            host.WriteErrorLine("Please try '/refresh' to start a new conversation.");
+        }
+        catch (Exception e)
+        {
+            host.WriteErrorLine($"Failed to start a chat session: {e.Message}\n{e.StackTrace}")
+                .WriteErrorLine()
+                .WriteErrorLine("Please try '/refresh' to start a new conversation.");
+        }
     }
 
     public async Task<bool> ChatAsync(string input, IShell shell)
@@ -117,40 +221,54 @@ public sealed class AzureAgent : ILLMAgent
             return true;
         }
 
+        if (!_chatSession.UserAuthorized)
+        {
+            host.WriteLine("\nSorry, you are not authorized to access Azure Copilot services.\n");
+            return true;
+        }
+
         try
         {
             string query = $"{input}\n\n---\n\n{_instructions}";
-            CopilotResponse copilotResponse = await host.RunWithSpinnerAsync(
+            _copilotResponse = await host.RunWithSpinnerAsync(
                 status: "Thinking ...",
                 spinnerKind: SpinnerKind.Processing,
                 func: async context => await _chatSession.GetChatResponseAsync(query, context, token)
             ).ConfigureAwait(false);
 
-            if (copilotResponse is null)
+            if (_copilotResponse is null)
             {
                 // User cancelled the operation.
                 return true;
             }
 
-            if (copilotResponse.ChunkReader is null)
+            if (_copilotResponse.ChunkReader is null)
             {
-                ArgPlaceholder?.DataRetriever?.Dispose();
-                ArgPlaceholder = null;
+                ResetArgumentPlaceholder();
 
-                // Process CLI handler response specially to support parameter injection.
-                ResponseData data = null;
-                if (copilotResponse.TopicName == CopilotActivity.CLIHandlerTopic)
+                if (_copilotResponse.IsError)
                 {
-                    data = ParseCLIHandlerResponse(copilotResponse, shell);
+                    host.WriteErrorLine()
+                        .WriteErrorLine(_copilotResponse.Text)
+                        .WriteErrorLine();
                 }
-
-                if (data?.PlaceholderSet is not null)
+                else
                 {
-                    ArgPlaceholder = new ArgumentPlaceholder(input, data, _httpClient);
-                }
+                    // Process CLI handler response specially to support parameter injection.
+                    ResponseData data = null;
+                    if (_copilotResponse.TopicName == CopilotActivity.CLIHandlerTopic)
+                    {
+                        data = ParseCLIHandlerResponse(shell);
+                    }
 
-                string answer = data is null ? copilotResponse.Text : GenerateAnswer(data);
-                host.RenderFullResponse(answer);
+                    if (data?.PlaceholderSet is not null)
+                    {
+                        ArgPlaceholder = new ArgumentPlaceholder(input, data, _httpClient);
+                    }
+
+                    string answer = data is null ? _copilotResponse.Text : GenerateAnswer(data);
+                    host.RenderFullResponse(answer);
+                }
             }
             else
             {
@@ -161,12 +279,12 @@ public sealed class AzureAgent : ILLMAgent
 
                     while (true)
                     {
-                        CopilotActivity activity = copilotResponse.ChunkReader.ReadChunk(token);
+                        CopilotActivity activity = _copilotResponse.ChunkReader.ReadChunk(token);
                         if (activity is null)
                         {
                             prevActivity.ExtractMetadata(out string[] suggestion, out ConversationState state);
-                            copilotResponse.SuggestedUserResponses = suggestion;
-                            copilotResponse.ConversationState = state;
+                            _copilotResponse.SuggestedUserResponses = suggestion;
+                            _copilotResponse.ConversationState = state;
                             break;
                         }
 
@@ -182,7 +300,7 @@ public sealed class AzureAgent : ILLMAgent
                 }
             }
 
-            var conversationState = copilotResponse.ConversationState;
+            var conversationState = _copilotResponse.ConversationState;
             _turnsLeft = conversationState.TurnLimit - conversationState.TurnNumber;
             if (_turnsLeft <= 5)
             {
@@ -199,6 +317,8 @@ public sealed class AzureAgent : ILLMAgent
                     host.WriteLine("\nYou've reached the maximum length of a conversation. To continue, please run '/refresh' to start a new conversation.\n");
                 }
             }
+
+            Telemetry.Trace(AzTrace.Chat(_copilotResponse));
         }
         catch (Exception ex) when (ex is TokenRequestException or ConnectionDroppedException)
         {
@@ -210,9 +330,9 @@ public sealed class AzureAgent : ILLMAgent
         return true;
     }
 
-    private ResponseData ParseCLIHandlerResponse(CopilotResponse copilotResponse, IShell shell)
+    private ResponseData ParseCLIHandlerResponse(IShell shell)
     {
-        string text = copilotResponse.Text;
+        string text = _copilotResponse.Text;
         List<CodeBlock> codeBlocks = shell.ExtractCodeBlocks(text, out List<SourceInfo> sourceInfos);
         if (codeBlocks is null || codeBlocks.Count is 0)
         {
@@ -264,7 +384,7 @@ public sealed class AzureAgent : ILLMAgent
             Text = text,
             CommandSet = commands,
             PlaceholderSet = placeholders,
-            Locale = copilotResponse.Locale,
+            Locale = _copilotResponse.Locale,
         };
 
         string first = placeholders[0].Name;
@@ -307,12 +427,18 @@ public sealed class AzureAgent : ILLMAgent
         else
         {
             // The placeholder section is not in the format as we've instructed ...
-            // TODO: send telemetry about this case.
             Log.Error("Placeholder section not in expected format:\n{0}", text);
+            Telemetry.Trace(AzTrace.Exception("Placeholder section not in expected format."));
         }
 
         ReplaceKnownPlaceholders(data);
         return data;
+    }
+
+    internal void ResetArgumentPlaceholder()
+    {
+        ArgPlaceholder?.DataRetriever?.Dispose();
+        ArgPlaceholder = null;
     }
 
     internal void SaveUserValue(string phName, string value)
@@ -420,7 +546,9 @@ public sealed class AzureAgent : ILLMAgent
                     _buffer.Append($"- `{phItem.Name}`: {phItem.Desc}\n");
                 }
 
-                _buffer.Append("\nRun `/replace` to get assistance in placeholder replacement.\n");
+                // Use green (0,195,0) on grey (48,48,48) for rendering the command '/replace'.
+                // TODO: the color formatting should be exposed by the shell as utility method.
+                _buffer.Append("\nRun \x1b[38;2;0;195;0;48;2;48;48;48m /replace \x1b[0m to get assistance in placeholder replacement.\n");
             }
         }
 

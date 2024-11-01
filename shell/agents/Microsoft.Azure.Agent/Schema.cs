@@ -1,17 +1,95 @@
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+
 using AIShell.Abstraction;
+using Azure.Core;
+using Azure.Identity;
 
 namespace Microsoft.Azure.Agent;
 
-internal class TokenPayload
+internal class AgentSetting
+{
+    public bool Logging { get; set; }
+    public bool Telemetry { get; set; }
+
+    public AgentSetting()
+    {
+        // Enable logging and telemetry by default.
+        Logging = true;
+        Telemetry = true;
+    }
+
+    internal static AgentSetting Default => new();
+
+    internal static AgentSetting LoadFromFile(string path)
+    {
+        FileInfo file = new(path);
+        if (file.Exists)
+        {
+            try
+            {
+                using var stream = file.OpenRead();
+                return JsonSerializer.Deserialize<AgentSetting>(stream, Utils.JsonOptions);
+            }
+            catch (Exception e)
+            {
+                throw new InvalidDataException($"Parsing settings from '{path}' failed with the following error: {e.Message}", e);
+            }
+        }
+
+        return null;
+    }
+
+    internal static void NewSettingFile(string path)
+    {
+        const string content = """
+            {
+              "logging": true,
+              "telemetry": true
+            }
+            """;
+        File.WriteAllText(path, content, Encoding.UTF8);
+    }
+}
+
+internal enum TokenHealth
+{
+    Good,
+    TimeToRefresh,
+    Expired
+}
+
+internal class CopilotPermission
+{
+    public bool Authorized { get; set; }
+    public string Message { get; set; }
+}
+
+internal class RefreshDLToken
 {
     public string ConversationId { get; set; }
     public string Token { get; set; }
 
     [JsonPropertyName("expires_in")]
     public int ExpiresIn { get; set; }
+}
+
+internal class NewDLToken
+{
+    public string Endpoint { get; set; }
+    public string Token { get; set; }
+    public int TokenExpiryTimeInSeconds { get; set; }
+}
+
+internal class DirectLineToken
+{
+    public string Id { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime LastModifiedAt { get; set; }
+    public NewDLToken DirectLine { get; set; }
 }
 
 internal class SessionPayload
@@ -102,30 +180,31 @@ internal class ConversationState
 
 internal class CopilotResponse
 {
-    internal CopilotResponse(ChunkReader chunkReader, string locale, string topicName)
+    internal CopilotResponse(CopilotActivity activity, ChunkReader chunkReader)
+        : this(activity)
     {
         ArgumentNullException.ThrowIfNull(chunkReader);
-        ArgumentException.ThrowIfNullOrEmpty(topicName);
-
         ChunkReader = chunkReader;
-        Locale = locale;
-        TopicName = topicName;
     }
 
-    internal CopilotResponse(string text, string locale, string topicName)
+    internal CopilotResponse(CopilotActivity activity)
     {
-        ArgumentException.ThrowIfNullOrEmpty(text);
-        ArgumentException.ThrowIfNullOrEmpty(topicName);
+        ArgumentNullException.ThrowIfNull(activity);
 
-        Text = text;
-        Locale = locale;
-        TopicName = topicName;
+        Text = activity.Text;
+        Locale = activity.Locale;
+        TopicName = activity.TopicName;
+        ReplyToId = activity.ReplyToId;
     }
 
     internal ChunkReader ChunkReader { get; }
     internal string Text { get; }
     internal string Locale { get; }
     internal string TopicName { get; }
+    internal string ReplyToId { get; }
+
+    internal bool IsError { get; set; }
+    internal string ConversationId { get; set; }
     internal string[] SuggestedUserResponses { get; set; }
     internal ConversationState ConversationState { get; set; }
 }
@@ -267,6 +346,144 @@ internal class AzCLICommand
         }
 
         return null;
+    }
+}
+
+#endregion
+
+#region token wrappers
+
+internal class UserAccessToken
+{
+    private readonly TokenRequestContext _tokenContext;
+    private AccessToken? _accessToken;
+
+    /// <summary>
+    /// The access token.
+    /// </summary>
+    internal string Token => _accessToken?.Token;
+
+    /// <summary>
+    /// Initialize an instance with the proper token request context.
+    /// </summary>
+    internal UserAccessToken()
+    {
+        _tokenContext = new TokenRequestContext(["7000789f-b583-4714-ab18-aef39213018a/.default"]);
+    }
+
+    /// <summary>
+    /// Create an access token, or renew an existing token.
+    /// </summary>
+    internal async Task CreateOrRenewTokenAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            bool needRefresh = !_accessToken.HasValue;
+            if (!needRefresh)
+            {
+                needRefresh = DateTimeOffset.UtcNow.AddMinutes(5) > _accessToken.Value.ExpiresOn;
+            }
+
+            if (needRefresh)
+            {
+                _accessToken = await new AzureCliCredential()
+                    .GetTokenAsync(_tokenContext, cancellationToken);
+            }
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            string message = $"Failed to generate the user access token: {e.Message}.";
+            Telemetry.Trace(AzTrace.Exception(message), e);
+            throw new TokenRequestException(message, e);
+        }
+    }
+
+    /// <summary>
+    /// Reset the access token.
+    /// </summary>
+    internal void Reset()
+    {
+        _accessToken = null;
+    }
+}
+
+internal class UserDirectLineToken
+{
+    private const string REFRESH_TOKEN_URL = "https://directline.botframework.com/v3/directline/tokens/refresh";
+
+    private string _token;
+    private DateTimeOffset _expireOn;
+
+    /// <summary>
+    /// The DirectLine token.
+    /// </summary>
+    internal string Token => _token;
+
+    /// <summary>
+    /// Initialize an instance.
+    /// </summary>
+    internal UserDirectLineToken(string token, int expiresInSec)
+    {
+        _token = token;
+        _expireOn = DateTimeOffset.UtcNow.AddSeconds(expiresInSec);
+    }
+
+    /// <summary>
+    /// Check the token health.
+    /// </summary>
+    /// <returns></returns>
+    internal TokenHealth CheckTokenHealth()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now > _expireOn || now.AddMinutes(2) >= _expireOn)
+        {
+            return TokenHealth.Expired;
+        }
+
+        if (now.AddMinutes(10) < _expireOn)
+        {
+            return TokenHealth.Good;
+        }
+
+        return TokenHealth.TimeToRefresh;
+    }
+
+    /// <summary>
+    /// Renew the DirectLine token.
+    /// </summary>
+    internal async Task RenewTokenAsync(HttpClient httpClient, CancellationToken cancellationToken)
+    {
+        TokenHealth health = CheckTokenHealth();
+        if (health is TokenHealth.Expired)
+        {
+            throw new TokenRequestException("The chat session has expired. Please start a new chat session.");
+        }
+
+        if (health is TokenHealth.Good)
+        {
+            return;
+        }
+
+        try
+        {
+            HttpRequestMessage request = new(HttpMethod.Post, REFRESH_TOKEN_URL);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+
+            var response = await httpClient.SendAsync(request, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            using Stream content = await response.Content.ReadAsStreamAsync(cancellationToken);
+            RefreshDLToken dlToken = JsonSerializer.Deserialize<RefreshDLToken>(content, Utils.JsonOptions);
+
+            _token = dlToken.Token;
+            _expireOn = DateTimeOffset.UtcNow.AddSeconds(dlToken.ExpiresIn);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            string message = $"Failed to renew the 'DirectLine' token: {e.Message}.";
+            Telemetry.Trace(AzTrace.Exception(message), e);
+            throw new TokenRequestException(message, e);
+        }
     }
 }
 

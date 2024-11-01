@@ -72,14 +72,17 @@ public sealed class InterpreterAgent : ILLMAgent
     }
 
     /// <inheritdoc/>
-    public Task RefreshChatAsync(IShell shell)
+    public Task RefreshChatAsync(IShell shell, bool force)
     {
-        // Reload the setting file if needed.
-        ReloadSettings();
-        // Reset the history so the subsequent chat can start fresh.
-        _chatService.RefreshChat();
-        // Shut down the execution service to start fresh.
-        _executionService.Terminate();
+        if (force)
+        {
+            // Reload the setting file if needed.
+            ReloadSettings();
+            // Reset the history so the subsequent chat can start fresh.
+            _chatService.RefreshChat();
+            // Shut down the execution service to start fresh.
+            _executionService.Terminate();
+        }
 
         return Task.CompletedTask;
     }
